@@ -24,7 +24,22 @@ using System.ComponentModel;
 
 public class SpeakersStart : MonoBehaviour
 {
-    public string VERSION_TAGNAME = "v0.4.4";
+    public string VERSION_TAGNAME = "v0.4.5";
+
+    /// <summary>
+    /// Shown when GitHub has no release for this tag yet, or is unreachable. The
+    /// popup used to come up blank in both of those cases.
+    /// </summary>
+    const string LOCAL_WHATS_NEW =
+        "- Added a \"Pause when not in game\" setting - Windows pauses your music or video when Echo VR is not reporting an active match, and resumes it when you are back in\n" +
+        "- Your selected app is now switched onto the virtual audio cable automatically when Echo Speaker System starts\n" +
+        "- VB-CABLE is now detected as well as Virtual Audio Cable. If neither is installed, ESS recommends one and links the download\n" +
+        "- Fixed the app hanging on startup with no window when the audio device could not be opened - it now explains the problem and lets you pick another input\n" +
+        "- Every redirected app is now put back on its original audio device when ESS exits or crashes, not just the selected one\n" +
+        "- Fixed spawn room logging that could add tens of MB to the Unity log file each session\n" +
+        "- Much lower Echo VR API polling in standalone mode, and smoother listener movement\n" +
+        "- Fixed a silent GoalHorn.wav permanently muting all audio after a goal\n" +
+        "[Created by iblowatsports]";
     public float playerXAbsMult = 1.0f;
     public float tunnelEndMapDist = 40.0001f;
     public float maxTunnelMapDist = 90f;
@@ -76,8 +91,6 @@ public class SpeakersStart : MonoBehaviour
     bool isGoalHornEnabled = true;
     bool isFirstAppInit = true;
     string appExeName = "";
-    string originalAppEndpoint = "";
-    bool wasAppEndpointChanged = false;
     public bool hasCleanedUp = false;
     bool goalHornPlaying = false;
 
@@ -116,8 +129,27 @@ public class SpeakersStart : MonoBehaviour
     int AudioInputIndex, AppSelectionIndex, ReverbPresetIndex;
     GameObject VACDownloadBtnGameObject, UpdateDownloadBtnGameObject;
     Button MSSettingsBtn, VACDownloadBtn, UpdateDownloadBtn, RefreshAppListBtn;
-    string VACInputName = "(Virtual Audio Cable)";
+    /// <summary>
+    /// Virtual audio cable products we can capture from, best recommendation first.
+    /// Device names are matched on short distinctive tokens rather than in full, because
+    /// Windows device names reach Unity truncated on some systems - "CABLE Output
+    /// (VB-Audio Virtual Cable)" can arrive clipped at 32 characters.
+    /// </summary>
+    static readonly VirtualCable[] KnownVirtualCables = new VirtualCable[]
+    {
+        new VirtualCable(
+            "VB-CABLE",
+            "https://vb-audio.com/Cable/",
+            "CABLE Input (VB-Audio Virtual Cable)",
+            new string[] { "VB-Audio", "CABLE Output" }),
+        new VirtualCable(
+            "Virtual Audio Cable",
+            "https://vac.muzychenko.net/",
+            "Line 1 (Virtual Audio Cable)",
+            new string[] { "Virtual Audio Cable" }),
+    };
     const int FREQUENCY = 48000;
+    const int MIC_START_TIMEOUT_MS = 5000;
     AudioClip masterClip, goalHornClip;
     float averageGoalHornLoudness, averageMusicLoudness, musicLoudnessAcc = 0.0f;
     long musicLoudnessCount = 0;
@@ -128,6 +160,12 @@ public class SpeakersStart : MonoBehaviour
     public static string updateFileName = "";
     float goalHornMaxDuration = 23f;
     bool inSpawnRoom = false;
+    Toggle pauseWhenNotInGameToggle;
+    bool pauseWhenNotInGame = false;
+    bool musicPausedForGame = false;
+    // App ids reported by MediaControl.exe when we paused them, so we resume only
+    // what we actually stopped and never restart something the user paused.
+    List<string> pausedMediaApps = new List<string>();
 
     // Use this for initialization
     void Start()
@@ -151,9 +189,19 @@ public class SpeakersStart : MonoBehaviour
         goalHornTimeSlider.value = goalHornMaxDuration;
         goalHornVolMultSlider.value = (goalHornVolumeUserMult - 0.5f)/0.05f;
         spawnRoomVolFloorSlider.value = (spawnRoomVolumeFloor)/0.05f;
+        pauseWhenNotInGameToggle = GameObject.Find("UICanvas").transform.GetComponentsInChildren<Transform>(true).FirstOrDefault(t => t.name == "PauseWhenNotInGameToggle").GetComponent<Toggle>();
+        pauseWhenNotInGame = PlayerPrefs.GetInt("PauseWhenNotInGame", 0) == 1;
+        pauseWhenNotInGameToggle.isOn = pauseWhenNotInGame;
+        pauseWhenNotInGameToggle.onValueChanged.AddListener(delegate
+        {
+            PauseWhenNotInGameChanged(pauseWhenNotInGameToggle);
+        });
         StartCoroutine(GetWhatsNew());
         string[] args = System.Environment.GetCommandLineArgs();
-        for (int i = 0; i < args.Length; i++)
+        // Start at 1: args[0] is the executable path, and matching against it meant an
+        // install directory that merely contained "reset" ("C:\\Presets\\...") wiped
+        // every saved setting on launch.
+        for (int i = 1; i < args.Length; i++)
         {
             if (args[i].Contains("selectinput"))
             {
@@ -184,15 +232,12 @@ public class SpeakersStart : MonoBehaviour
             foreach(AppEndpoint end in AppEndPoints.endpoints){
                 ResetAppEndpoint(end.appName, end.originalEndpointID);
             }
-            originalAppEndpoint = "";
             PlayerPrefs.DeleteKey("AppSourceOriginalEndpoints");
         }
         AudioInputDropdown = GameObject.Find("AudioSourceDropdown").GetComponent<Dropdown>();
-        if(inputName != "Line 1 (Virtual Audio Cable)"){
-            ShowHideInputDropdown(true);
-        }else{
-            ShowHideInputDropdown(false);
-        }
+        // Show the picker whenever the saved input is something we do not recognise as
+        // a virtual cable, so a hand-picked device stays visible and adjustable.
+        ShowHideInputDropdown(!IsVirtualCableDevice(inputName));
         AudioInputDropdown.ClearOptions();
         AppSelectionDropdown = GameObject.Find("AppSelectionDropdown").GetComponent<Dropdown>();
         ReverbPresetDropdown = GameObject.Find("UICanvas").transform.GetComponentsInChildren<Transform>(true).FirstOrDefault(t => t.name == "ReverbPresetDropdown").GetComponent<Dropdown>();
@@ -273,7 +318,7 @@ public class SpeakersStart : MonoBehaviour
             reverb.enabled = true;
         }
         bool defaultFound = false;
-        bool VACFound = false;
+        string installedCableDevice = null;
         foreach (var device in Microphone.devices)
         {
             AudioInputData = new Dropdown.OptionData();
@@ -286,11 +331,29 @@ public class SpeakersStart : MonoBehaviour
                 defaultFound = true;
                 AudioInputDropdown.value = AudioInputIndex;
             }
-            if (device.Contains(VACInputName))
+            if (installedCableDevice == null && IsVirtualCableDevice(device))
             {
-                VACFound = true;
+                installedCableDevice = device;
             }
             UnityEngine.Debug.Log("Name: " + device);
+        }
+        if (!defaultFound && installedCableDevice != null)
+        {
+            // The saved device is gone but a cable is installed, so adopt it instead of
+            // failing. This is what lets a fresh VB-CABLE install work without the user
+            // having to touch the input dropdown at all. Done here, before the
+            // onValueChanged listener is attached below, so it cannot re-enter
+            // sourceInit() while Start() is still running.
+            inputName = installedCableDevice;
+            PlayerPrefs.SetString("InputName", inputName);
+            PlayerPrefs.Save();
+            int adoptedIndex = AudioInputMessages.FindIndex(m => m.text == inputName);
+            if (adoptedIndex >= 0)
+            {
+                AudioInputDropdown.value = adoptedIndex;
+            }
+            defaultFound = true;
+            ShowHideInputDropdown(false);
         }
         AudioInputDropdown.onValueChanged.AddListener(delegate
         {
@@ -330,15 +393,15 @@ public class SpeakersStart : MonoBehaviour
             AppSelectionDropdownValueChanged(AppSelectionDropdown);
         });
         refreshAppList();
-        if (!defaultFound && !VACFound)
+        AutoSwitchRememberedAppToCable();
+        if (!defaultFound && installedCableDevice == null)
         {
+            // No virtual audio cable of any kind is installed. Surface the download
+            // button here; sourceInit() below raises the single dialog that names the
+            // recommended cable and shows its link, so the same problem does not
+            // produce two message boxes in a row.
             ShowHideInputDropdown(true);
-            Error("Couldn't find audio device " + inputName + ". Make sure to install Virtual Audio Cable and set the output device of your music source to " + inputName + " in the Windows settings under 'App Volume and Device Settings'.", "Error");
-            VACDownloadBtnGameObject.SetActive(true);
-            VACDownloadBtn.onClick.AddListener(delegate
-            {
-                OpenVACDownload();
-            });
+            ShowCableDownloadButton();
         }
 
         sourceInit();
@@ -454,11 +517,30 @@ public class SpeakersStart : MonoBehaviour
                 aSource.Stop();
             }
         }
+        if (!Microphone.devices.Contains(inputName))
+        {
+            OnAudioInputUnavailable("Couldn't find audio device \"" + inputName + "\". Make sure your virtual audio cable is still installed, and that the output device of your music source is set to it in the Windows settings under 'App Volume and Device Settings'.");
+            return;
+        }
         masterClip = Microphone.Start(inputName, true, 300, FREQUENCY);
         reverseLoopOrder = false;
         loops = 0;
         //masterClip = AudioClip.Create("test", 300 * FREQUENCY, 1, FREQUENCY, false);
-        while (!(Microphone.GetPosition(inputName) > 0)) { }
+        // Wait for the capture device to hand us samples, but give up rather than spin
+        // forever: a device that is present but never streams used to hang the whole app
+        // here, with no window, no message and no way out but Task Manager.
+        Stopwatch micStartTimer = Stopwatch.StartNew();
+        while (!(Microphone.GetPosition(inputName) > 0))
+        {
+            if (micStartTimer.ElapsedMilliseconds > MIC_START_TIMEOUT_MS)
+            {
+                Microphone.End(inputName);
+                masterClip = null;
+                OnAudioInputUnavailable("Audio device \"" + inputName + "\" never started streaming. Pick a different input below, or reinstall your virtual audio cable.");
+                return;
+            }
+            Thread.Sleep(1);
+        }
         masterSpeaker.clip = masterClip;
         masterSpeaker.loop = true;
         masterSpeaker.dopplerLevel = 0f;
@@ -469,6 +551,136 @@ public class SpeakersStart : MonoBehaviour
             aSource.loop = true;
         }
         StartCoroutine(SyncSourcesInit());
+    }
+
+    static VirtualCable RecommendedCable
+    {
+        get { return KnownVirtualCables[0]; }
+    }
+
+    /// <summary>
+    /// The known virtual cable product a recording device belongs to, or null.
+    /// </summary>
+    static VirtualCable MatchVirtualCable(string deviceName)
+    {
+        if (string.IsNullOrEmpty(deviceName))
+        {
+            return null;
+        }
+        foreach (VirtualCable cable in KnownVirtualCables)
+        {
+            foreach (string token in cable.deviceNameTokens)
+            {
+                if (deviceName.IndexOf(token, StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    return cable;
+                }
+            }
+        }
+        return null;
+    }
+
+    static bool IsVirtualCableDevice(string deviceName)
+    {
+        return MatchVirtualCable(deviceName) != null;
+    }
+
+    /// <summary>
+    /// First recording device belonging to a known virtual cable, or null if the user has
+    /// none installed.
+    /// </summary>
+    static string FindInstalledCableDevice()
+    {
+        foreach (string device in Microphone.devices)
+        {
+            if (IsVirtualCableDevice(device))
+            {
+                return device;
+            }
+        }
+        return null;
+    }
+
+    /// <summary>
+    /// Reveals the download button and points it at the recommended cable, relabelling it
+    /// to match so the button never advertises a product we are not linking to.
+    /// </summary>
+    void ShowCableDownloadButton()
+    {
+        if (VACDownloadBtnGameObject == null || VACDownloadBtn == null)
+        {
+            return;
+        }
+        VACDownloadBtnGameObject.SetActive(true);
+        Text label = VACDownloadBtnGameObject.GetComponentInChildren<Text>(true);
+        if (label != null)
+        {
+            label.text = "Download " + RecommendedCable.displayName;
+        }
+        VACDownloadBtn.onClick.RemoveAllListeners();
+        VACDownloadBtn.onClick.AddListener(delegate
+        {
+            OpenCableDownload();
+        });
+    }
+
+    /// <summary>
+    /// What to tell the user when no virtual cable is installed: which one to get, where
+    /// to get it, and what to do once it is in.
+    /// </summary>
+    static string CableRecommendationText()
+    {
+        VirtualCable rec = RecommendedCable;
+        return "No virtual audio cable was found. Echo Speaker System needs one to capture "
+            + "the audio it plays through the arena speakers.\n\n"
+            + "Recommended: " + rec.displayName + " (free)\n"
+            + rec.downloadUrl + "\n\n"
+            + "Install it, then set your music app's playback device to \""
+            + rec.playbackDeviceHint + "\" in the Windows settings under 'App Volume and "
+            + "Device Settings', and restart Echo Speaker System.\n\n"
+            + "The \"Download " + rec.displayName + "\" button in the app opens this link.";
+    }
+
+    /// <summary>
+    /// Called when the capture device cannot be opened. Leaves the app running and usable
+    /// so the input can be re-picked, instead of hanging with no audio and no UI.
+    /// </summary>
+    void OnAudioInputUnavailable(string message)
+    {
+        isReady = false;
+        if (playerListener != null)
+        {
+            playerListener.speakersReady = false;
+        }
+        ShowHideInputDropdown(true);
+        if (FindInstalledCableDevice() == null)
+        {
+            // Nothing usable is installed, so follow the specific failure with the
+            // recommendation and its link rather than leaving the user to work out
+            // what to install.
+            ShowCableDownloadButton();
+            message += "\n\n" + CableRecommendationText();
+        }
+        Error(message, "Echo Speaker System - Audio Input");
+    }
+
+    /// <summary>
+    /// Persists the crash-recovery record of which app we moved off which endpoint.
+    /// JsonUtility cannot serialise a bare List&lt;T&gt; - it silently produces "{}" - so the
+    /// list has to be wrapped in an object before it is written.
+    /// </summary>
+    void SaveOriginalAppEndpoints()
+    {
+        if (originalAppEndpoints.Count == 0)
+        {
+            PlayerPrefs.DeleteKey("AppSourceOriginalEndpoints");
+        }
+        else
+        {
+            PlayerPrefs.SetString("AppSourceOriginalEndpoints",
+                JsonUtility.ToJson(new AppAudioEndpoints { endpoints = originalAppEndpoints }));
+        }
+        PlayerPrefs.Save();
     }
 
     void refreshAppList()
@@ -594,6 +806,7 @@ public class SpeakersStart : MonoBehaviour
                     }
                     if (isReady)
                     {
+                        UpdateGameActivityPause();
                         if (playerListener.goalScored)
                         {
                             if(goalHornPlaying || !isGoalHornEnabled){
@@ -609,7 +822,14 @@ public class SpeakersStart : MonoBehaviour
                                     // StartCoroutine(StartFade(0.25f, 1));
                                     clipZeroed = false;
                                 }
-                                goalHornClipVolMult = averageMusicLoudness == 0.0f ? 0.3f : ((averageMusicLoudness *goalHornVolumeUserMult) / averageGoalHornLoudness);//+ 0.03225f;
+                                // Guard the divisor and clamp the result. A silent or
+                                // near-silent GoalHorn.wav produced an infinite
+                                // multiplier here, and the reciprocal applied when the
+                                // horn finished then muted every speaker for the rest
+                                // of the session. The round trip has to stay finite.
+                                goalHornClipVolMult = (averageMusicLoudness == 0.0f || averageGoalHornLoudness <= 0.0f)
+                                    ? 0.3f
+                                    : Mathf.Clamp((averageMusicLoudness * goalHornVolumeUserMult) / averageGoalHornLoudness, 0.01f, 10.0f);
                                 foreach (AudioSource aSource in speakers)
                                 {
                                     // speakerEchos[aSource.name].delay = 0f;
@@ -673,7 +893,6 @@ public class SpeakersStart : MonoBehaviour
                         {
                             float vol = Map((playerXAbs*playerXAbsMult), tunnelEndMapDist, maxTunnelMapDist, minVolumeMap, maxVolumeMap);
                             AudioListener.volume = listenerVolume * (spawnRoomVolumeFloor + (Mathf.Log10(vol) / -4.0f));//41/(playerXAbs);// Mathf.Log10((41/(Math.Abs(playerListener.head.position.x)))*(41/(Math.Abs(playerListener.head.position.x))) * 20) - 0.29f; //
-                            UnityEngine.Debug.Log(AudioListener.volume);                                                          //Debug.Log(AudioListener.volume);
                             if(!inSpawnRoom){
                                 foreach (AudioReverbFilter reverb in speakerReverbs.Values)
                                 {
@@ -933,9 +1152,9 @@ public class SpeakersStart : MonoBehaviour
 
         Application.Quit();
     }
-    void OpenVACDownload()
+    void OpenCableDownload()
     {
-        Application.OpenURL("https://software.muzychenko.net/freeware/vac464lite.zip");
+        Application.OpenURL(RecommendedCable.downloadUrl);
         VACDownloadBtnGameObject.SetActive(false);
     }
     private IEnumerator SyncSourcesInit()
@@ -1156,7 +1375,6 @@ public class SpeakersStart : MonoBehaviour
             string line = AudioSwitch.StandardOutput.ReadLine();
             if (AudioSwitch.ExitCode == 0)
             {
-                wasAppEndpointChanged = true;
                 if (retainOriginalEndpoint)
                 {
                     if (string.IsNullOrWhiteSpace(line))
@@ -1167,11 +1385,7 @@ public class SpeakersStart : MonoBehaviour
                     {
                         originalAppEndpoints.Add(new AppEndpoint {appName = appExeName, processId = procID, originalEndpointID = line });
                     }
-                    AppAudioEndpoints ae = new AppAudioEndpoints{endpoints = originalAppEndpoints};
-                    // ae.endpoints = originalAppEndpoints;
-                    string endpointJSON = JsonUtility.ToJson(ae);
-                    PlayerPrefs.SetString("AppSourceOriginalEndpoints", endpointJSON);
-                    PlayerPrefs.Save();
+                    SaveOriginalAppEndpoints();
                 }
             }
         }
@@ -1199,12 +1413,8 @@ public class SpeakersStart : MonoBehaviour
             };
             AudioSwitch.Start();
             AudioSwitch.WaitForExit(900);
-            wasAppEndpointChanged = false;
-            originalAppEndpoint = "";
             originalAppEndpoints.Remove(originalEndpoint);
-            string endpointJSON = JsonUtility.ToJson(originalAppEndpoints);
-            PlayerPrefs.SetString("AppSourceOriginalEndpoints", endpointJSON);
-            PlayerPrefs.Save();
+            SaveOriginalAppEndpoints();
         }
         yield return null;
     }
@@ -1216,7 +1426,7 @@ public class SpeakersStart : MonoBehaviour
             Cleanup();
 
         }
-        catch (Exception ex)
+        catch (Exception)
         {
             UnityEngine.Debug.Log("Disconnect failed");
         }
@@ -1224,46 +1434,49 @@ public class SpeakersStart : MonoBehaviour
 
     void Cleanup()
     {
-        try
+        if (hasCleanedUp)
         {
-            if (!hasCleanedUp)
-            {
-                playerListener.Cleanup();
-                Microphone.End(inputName);
-                if (wasAppEndpointChanged)
-                {
-                    var Originalsession = audioEndpointsJson.endpoints
-                .SelectMany(e => e.sessions)
-                .Where(s => s.exeName == appExeName)
-                .FirstOrDefault();
-                    if (Originalsession != null)
-                    {
-                        Process AudioSwitch = new Process
-                        {
-                            StartInfo = new ProcessStartInfo
-                            {
-                                FileName = (Application.streamingAssetsPath + "\\AudioSwitch.exe"),
-                                Arguments = Originalsession.processId + " \"" + originalAppEndpoint + "\"",
-                                UseShellExecute = false,
-                                RedirectStandardOutput = true,
-                                RedirectStandardInput = true,
-                                RedirectStandardError = true,
-                                CreateNoWindow = true
-                            }
-
-                        };
-                        AudioSwitch.Start();
-                        AudioSwitch.WaitForExit(900);
-                        wasAppEndpointChanged = false;
-                        originalAppEndpoint = "";
-                        PlayerPrefs.DeleteKey("AppSourceOriginalEndpoints");
-
-                        hasCleanedUp = true;
-                    }
-                }
-            }
+            return;
         }
-        catch (Exception ex) { }
+        // Marked up front: Cleanup is reachable from both FixedUpdate and
+        // OnApplicationQuit, and every step below must run at most once. Each step is
+        // guarded separately so one failure cannot skip the others - restoring the user's
+        // audio endpoints matters even if the socket teardown throws.
+        hasCleanedUp = true;
+
+        // Never leave the user's music paused because ESS exited.
+        try { ResumePausedMedia(); } catch (Exception) { }
+        try { playerListener.Cleanup(); } catch (Exception) { }
+        try { Microphone.End(inputName); } catch (Exception) { }
+        try { RestoreAllAppEndpoints(); } catch (Exception) { }
+    }
+
+    /// <summary>
+    /// Points every application we redirected back at the endpoint it was on before we
+    /// touched it, then clears the crash-recovery record. The old code only ever restored
+    /// the currently selected app, and sent it to the default device rather than to the
+    /// endpoint actually recorded for it.
+    /// </summary>
+    void RestoreAllAppEndpoints()
+    {
+        if (originalAppEndpoints.Count == 0)
+        {
+            return;
+        }
+        // Endpoints are re-applied by exe name, so refresh the session list first in case
+        // a process id moved while we were running.
+        try { audioEndpointsJson = GetAudioInfo(); } catch (Exception) { }
+
+        foreach (AppEndpoint endpoint in originalAppEndpoints.ToArray())
+        {
+            try
+            {
+                ResetAppEndpoint(endpoint.appName, endpoint.originalEndpointID);
+            }
+            catch (Exception) { }
+        }
+        originalAppEndpoints.Clear();
+        SaveOriginalAppEndpoints();
     }
 
     void ResetAppEndpointFromPreviousSession(string appName, string endpoint){
@@ -1311,7 +1524,7 @@ public class SpeakersStart : MonoBehaviour
                     string resp = webRequest.downloadHandler.text;
                     VersionJson latestVersion = JsonUtility.FromJson<VersionJson>(resp);
                     
-                    if (latestVersion.tag_name != VERSION_TAGNAME)
+                    if (IsNewerVersion(latestVersion.tag_name, VERSION_TAGNAME))
                     {
                         latestReleaseVer = latestVersion.tag_name;
                         latestReleaseURL = latestVersion.assets.First(url => url.browser_download_url.EndsWith("exe")).browser_download_url;
@@ -1332,47 +1545,273 @@ public class SpeakersStart : MonoBehaviour
 
     IEnumerator GetWhatsNew()
     {
+        string body = null;
         using (UnityWebRequest webRequest = UnityWebRequest.Get("https://api.github.com/repos/iblowatsports/Echo-VR-Speaker-System/releases"))
         {
-            // Request and wait for the desired page. 73
-
             yield return webRequest.SendWebRequest();
-            try
+            if (!webRequest.isNetworkError)
             {
-                if (webRequest.isNetworkError)
+                try
                 {
-                }
-                else
-                {
-                    string resp = webRequest.downloadHandler.text;
-                    VersionJson[] releases = JsonHelper.FromJson<VersionJson>(resp);
-                    
+                    VersionJson[] releases = JsonHelper.FromJson<VersionJson>(webRequest.downloadHandler.text);
                     VersionJson thisRelease = releases.FirstOrDefault(r => r.tag_name == VERSION_TAGNAME);
-                    if(thisRelease != null){
-                        GameObject.Find("UICanvas").transform.GetComponentsInChildren<Transform>(true).FirstOrDefault(t => t.name == "WhatsNewText").GetComponent<Text>().text = thisRelease.body.Replace("**","").Replace(" _"," ").Replace("_ ", " ");
-                        GameObject.Find("UICanvas").transform.GetComponentsInChildren<Transform>(true).FirstOrDefault(t => t.name == "WhatsNewTitle").GetComponent<Text>().text = "What's New (" + VERSION_TAGNAME + ")";
-                    if(isNewUpdate){
-                        PlayerPrefs.SetString("RunningVersion", VERSION_TAGNAME);
-                        PlayerPrefs.Save();
-                        GameObject.Find("UICanvas").transform.GetComponentsInChildren<Transform>(true).FirstOrDefault(t => t.name == "WhatsNewPopup").gameObject.SetActive(true);
-                    }
-                    else{
-                        GameObject.Find("UICanvas").transform.GetComponentsInChildren<Transform>(true).FirstOrDefault(t => t.name == "WhatsNewPopup").gameObject.SetActive(false);
-                    }
+                    if (thisRelease != null)
+                    {
+                        body = thisRelease.body;
                     }
                 }
+                catch (Exception) { }
             }
-            catch(Exception ex)
+        }
+        ShowWhatsNew(body);
+    }
+
+    void PauseWhenNotInGameChanged(Toggle change)
+    {
+        pauseWhenNotInGame = change.isOn;
+        PlayerPrefs.SetInt("PauseWhenNotInGame", pauseWhenNotInGame ? 1 : 0);
+        PlayerPrefs.Save();
+    }
+
+    /// <summary>
+    /// Optional: ask Windows to pause whatever is playing while Echo VR is not reporting
+    /// an active match, and resume it when a match comes back. This drives the real media
+    /// session (the same thing the volume overlay controls) through MediaControl.exe,
+    /// because Unity's Mono runtime cannot reach WinRT itself.
+    /// </summary>
+    void UpdateGameActivityPause()
+    {
+        if (!pauseWhenNotInGame)
+        {
+            if (musicPausedForGame)
             {
-                GameObject.Find("UICanvas").transform.GetComponentsInChildren<Transform>(true).FirstOrDefault(t => t.name == "WhatsNewTitle").GetComponent<Text>().text = "What's New (" + VERSION_TAGNAME + ")";
-                GameObject.Find("UICanvas").transform.GetComponentsInChildren<Transform>(true).FirstOrDefault(t => t.name == "WhatsNewPopup").gameObject.SetActive(false);
+                musicPausedForGame = false;
+                ResumePausedMedia();
             }
+            return;
+        }
+        bool inGame = playerListener.IsInGame;
+        if (!inGame && !musicPausedForGame)
+        {
+            musicPausedForGame = true;
+            PauseActiveMedia();
+        }
+        else if (inGame && musicPausedForGame)
+        {
+            musicPausedForGame = false;
+            ResumePausedMedia();
+        }
+    }
+
+    /// <summary>
+    /// Runs MediaControl.exe and returns whatever it wrote to stdout, or null if the
+    /// helper is missing or Windows has no media session API (pre-1809).
+    /// </summary>
+    string RunMediaControl(string arguments)
+    {
+        try
+        {
+            string exe = Application.streamingAssetsPath + "\\MediaControl.exe";
+            if (!File.Exists(exe))
+            {
+                return null;
+            }
+            Process helper = new Process
+            {
+                StartInfo = new ProcessStartInfo
+                {
+                    FileName = exe,
+                    Arguments = arguments,
+                    UseShellExecute = false,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    CreateNoWindow = true
+                }
+            };
+            helper.Start();
+            // Read before waiting: a full pipe buffer would otherwise deadlock the wait.
+            string output = helper.StandardOutput.ReadToEnd();
+            helper.WaitForExit(3000);
+            return output;
+        }
+        catch (Exception)
+        {
+            return null;
+        }
+    }
+
+    void PauseActiveMedia()
+    {
+        pausedMediaApps.Clear();
+        string output = RunMediaControl("pause");
+        if (string.IsNullOrEmpty(output))
+        {
+            return;
+        }
+        foreach (string line in output.Split('\n'))
+        {
+            string id = line.Trim();
+            if (id.Length > 0)
+            {
+                pausedMediaApps.Add(id);
+            }
+        }
+    }
+
+    void ResumePausedMedia()
+    {
+        if (pausedMediaApps.Count == 0)
+        {
+            return;
+        }
+        StringBuilder args = new StringBuilder("play");
+        foreach (string id in pausedMediaApps)
+        {
+            args.Append(" \"").Append(id).Append("\"");
+        }
+        RunMediaControl(args.ToString());
+        pausedMediaApps.Clear();
+    }
+
+    /// <summary>
+    /// Puts the app you last used back on the virtual cable as soon as ESS starts, so music
+    /// routes through the speakers without having to re-pick it from the dropdown.
+    /// </summary>
+    void AutoSwitchRememberedAppToCable()
+    {
+        if (string.IsNullOrEmpty(appExeName) || !IsVirtualCableDevice(inputName))
+        {
+            return;
+        }
+        if (audioEndpointsJson == null || audioEndpointsJson.endpoints == null)
+        {
+            return;
+        }
+        Session session = audioEndpointsJson.endpoints
+            .SelectMany(e => e.sessions)
+            .FirstOrDefault(sn => sn.exeName == appExeName);
+        if (session == null)
+        {
+            return;
+        }
+        // Never switch twice: a second pass would record the cable itself as the app's
+        // "original" endpoint and we would restore it to the cable on exit.
+        if (originalAppEndpoints.Any(ep => ep.processId == session.processId))
+        {
+            return;
+        }
+        Endpoint cable = audioEndpointsJson.endpoints.FirstOrDefault(e => e.name == inputName);
+        if (cable != null && cable.sessions != null
+            && cable.sessions.Any(sn => sn.processId == session.processId))
+        {
+            return;   // already routed to the cable
+        }
+        isFirstAppInit = false;
+        StartCoroutine(setAppToVAC(session.processId, inputName));
+    }
+
+    /// <summary>
+    /// True when a release tag is genuinely newer than what we are running. The old check
+    /// was a plain inequality, which offered a "update" whenever the local build was ahead
+    /// of the newest published release.
+    /// </summary>
+    static bool IsNewerVersion(string remoteTag, string localTag)
+    {
+        int[] remote = ParseVersion(remoteTag);
+        int[] local = ParseVersion(localTag);
+        if (remote == null || local == null)
+        {
+            return remoteTag != localTag;
+        }
+        for (int i = 0; i < 3; i++)
+        {
+            if (remote[i] != local[i])
+            {
+                return remote[i] > local[i];
+            }
+        }
+        return false;
+    }
+
+    static int[] ParseVersion(string tag)
+    {
+        if (string.IsNullOrEmpty(tag))
+        {
+            return null;
+        }
+        string[] parts = tag.TrimStart('v', 'V').Split('.');
+        int[] nums = new int[3];
+        for (int i = 0; i < 3 && i < parts.Length; i++)
+        {
+            string digits = new string(parts[i].TakeWhile(char.IsDigit).ToArray());
+            if (digits.Length == 0 || !int.TryParse(digits, out nums[i]))
+            {
+                return null;
+            }
+        }
+        return nums;
+    }
+
+    /// <summary>
+    /// Renders the release notes, falling back to the notes compiled into this build when
+    /// GitHub has no release for this tag or could not be reached.
+    /// </summary>
+    void ShowWhatsNew(string body)
+    {
+        body = string.IsNullOrEmpty(body)
+            ? LOCAL_WHATS_NEW
+            : body.Replace("**", "").Replace(" _", " ").Replace("_ ", " ");
+
+        Transform canvas = GameObject.Find("UICanvas").transform;
+        Transform title = canvas.GetComponentsInChildren<Transform>(true)
+            .FirstOrDefault(t => t.name == "WhatsNewTitle");
+        Transform text = canvas.GetComponentsInChildren<Transform>(true)
+            .FirstOrDefault(t => t.name == "WhatsNewText");
+        Transform popup = canvas.GetComponentsInChildren<Transform>(true)
+            .FirstOrDefault(t => t.name == "WhatsNewPopup");
+
+        if (title != null)
+        {
+            title.GetComponent<Text>().text = "What's New (" + VERSION_TAGNAME + ")";
+        }
+        if (text != null)
+        {
+            text.GetComponent<Text>().text = body;
+        }
+        if (popup != null)
+        {
+            popup.gameObject.SetActive(isNewUpdate);
+        }
+        if (isNewUpdate)
+        {
+            PlayerPrefs.SetString("RunningVersion", VERSION_TAGNAME);
+            PlayerPrefs.Save();
         }
     }
 
     float Map(float s, float a1, float a2, float b1, float b2)
     {
         return b1 + (s - a1) * (b2 - b1) / (a2 - a1);
+    }
+}
+
+/// <summary>
+/// A virtual audio cable product Echo Speaker System can capture from.
+/// </summary>
+public class VirtualCable
+{
+    public readonly string displayName;
+    public readonly string downloadUrl;
+    public readonly string playbackDeviceHint;
+    public readonly string[] deviceNameTokens;
+
+    public VirtualCable(string displayName, string downloadUrl, string playbackDeviceHint,
+        string[] deviceNameTokens)
+    {
+        this.displayName = displayName;
+        this.downloadUrl = downloadUrl;
+        this.playbackDeviceHint = playbackDeviceHint;
+        this.deviceNameTokens = deviceNameTokens;
     }
 }
 

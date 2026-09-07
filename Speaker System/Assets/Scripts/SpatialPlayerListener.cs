@@ -9,7 +9,6 @@ using System.Threading;
 
 public class SpatialPlayerListener : MonoBehaviour
 {
-    static string defaultPos = "{\"position\":[ 0,0,-23], \"forward\":[0.0,0.0,1.0], \"left\":[0.0,0.0,0.0], \"up\":[0.0,0.0,0.0]}";
     GameObject playerObject;
     static string echoVRIP = "127.0.0.1";
     static string echoVRPort = "6721";
@@ -23,14 +22,24 @@ public class SpatialPlayerListener : MonoBehaviour
     public NetMQPoller poller;
     public SubscriberSocket subSocket;
     public string addr = "tcp://localhost:12345";
+    [Tooltip("Seconds for the listener to close most of the gap to a new head pose. "
+        + "Lower is snappier, higher is smoother.")]
+    public float headSmoothingTime = 0.05f;
+    const float API_RETRY_DELAY_SECONDS = 1f;
+    // How long without a parsed frame before we call the player "not in game".
+    const float GAME_DATA_TIMEOUT_SECONDS = 2f;
 
     float[] _playerHeadPosition;
     float[] _playerHeadForward;
     float[] _playerHeadUp;
 
     string tempPlayerName = "";
-    float lastAPITime = 0.0f;
     bool isClientSpectator = false;
+    bool lastRequestFailed = false;
+    // Set on whichever thread parsed a frame (the NetMQ poller has no access to
+    // Unity's time API), then consumed on the main thread in Update().
+    volatile bool frameArrived = false;
+    float lastFrameRealtime = -999f;
     public bool quitCalled = false;
     public bool hasCleanedUp = false;
     public bool speakersReady = false;
@@ -39,7 +48,9 @@ public class SpatialPlayerListener : MonoBehaviour
     {
         SetDefaultListenerPosition();
         string[] args = System.Environment.GetCommandLineArgs();
-        for (int i = 0; i < args.Length; i++)
+        // Start at 1: args[0] is the executable path, so an install directory
+        // containing "ignitebot" would otherwise force Spark-embedded mode.
+        for (int i = 1; i < args.Length; i++)
         {
             Debug.Log("ARG " + i + ": " + args[i]);
             if (args[i].Contains("ignitebot"))
@@ -49,6 +60,10 @@ public class SpatialPlayerListener : MonoBehaviour
             }
         }
         playerObject = GameObject.Find("Player Listener");
+        if (playerObject == null)
+        {
+            playerObject = gameObject;
+        }
         if (isIgniteBotEmbedded)
         {
             AsyncIO.ForceDotNet.Force();
@@ -66,33 +81,125 @@ public class SpatialPlayerListener : MonoBehaviour
             poller.Add(subSocket);
             poller.RunAsync();
         }
-    }
-    IEnumerator LerpFunction(Quaternion endValue, float duration)
-    {
-        float time = 0;
-        Quaternion startValue = playerObject.transform.rotation;
-
-        while (time < duration)
+        else
         {
-            playerObject.transform.rotation = Quaternion.Lerp(startValue, endValue, time / duration);
-            time += Time.deltaTime;
-            yield return null;
+            // One request in flight at a time. Update() used to kick off a fresh
+            // UnityWebRequest every frame - roughly 60 a second - so requests piled up
+            // against the Echo VR API faster than it could answer them.
+            StartCoroutine(PollApiLoop());
         }
-        playerObject.transform.rotation = endValue;
     }
-    IEnumerator LerpPosition(Vector3 targetPosition, float duration)
-    {
-        float time = 0;
-        Vector3 startPosition = playerObject.transform.position;
 
-        while (time < duration)
+    IEnumerator PollApiLoop()
+    {
+        while (!quitCalled)
         {
-            playerObject.transform.position = Vector3.Lerp(startPosition, targetPosition, time / duration);
-            time += Time.deltaTime;
-            yield return null;
+            if (!speakersReady)
+            {
+                yield return null;
+                continue;
+            }
+            yield return GetRequest();
+            if (lastRequestFailed)
+            {
+                // Echo VR is not running, or its API is switched off. Back off instead
+                // of hammering a refused connection every frame.
+                yield return new WaitForSeconds(API_RETRY_DELAY_SECONDS);
+            }
         }
-        playerObject.transform.position = targetPosition;
     }
+
+    /// <summary>
+    /// True while Echo VR is still delivering match frames. Goes false a couple of
+    /// seconds after the game closes, the API is switched off, or a match is left.
+    /// </summary>
+    public bool IsInGame
+    {
+        get { return Time.realtimeSinceStartup - lastFrameRealtime < GAME_DATA_TIMEOUT_SECONDS; }
+    }
+
+    /// <summary>
+    /// Pulls the local player's head transform (or, when spectating, the followed
+    /// player's) out of an API frame. Shared by the Spark/NetMQ and standalone HTTP paths,
+    /// which previously carried two copies of this logic.
+    /// </summary>
+    void ApplyFrame(Frame apiFrame)
+    {
+        if (apiFrame == null || apiFrame.teams == null)
+        {
+            return;
+        }
+        bool found = false;
+        foreach (Team t in apiFrame.teams)
+        {
+            if (t == null || t.players == null)
+            {
+                continue;
+            }
+            foreach (Player p in t.players)
+            {
+                if (p == null)
+                {
+                    continue;
+                }
+                if (p.name == apiFrame.client_name)
+                {
+                    if (t.team == "SPECTATORS")
+                    {
+                        isClientSpectator = true;
+                    }
+                    else
+                    {
+                        found = true;
+                        isClientSpectator = false;
+                        SetHead(p.head);
+                    }
+                }
+                else if (isClientSpectator)
+                {
+                    if (tempPlayerName.Length < 1)
+                    {
+                        if (t.team != "SPECTATORS" && !found)
+                        {
+                            found = true;
+                            tempPlayerName = p.name;
+                            SetHead(p.head);
+                        }
+                    }
+                    else if (p.name == tempPlayerName && t.team != "SPECTATORS")
+                    {
+                        found = true;
+                        tempPlayerName = p.name;
+                        SetHead(p.head);
+                    }
+                }
+            }
+        }
+        if (!found && tempPlayerName.Length > 0)
+        {
+            tempPlayerName = "";
+        }
+        frameArrived = true;
+    }
+
+    /// <summary>
+    /// Only publishes a pose once every component is present and long enough to read, so
+    /// Update() can never index past the end of a short array from a malformed frame.
+    /// </summary>
+    void SetHead(Head head)
+    {
+        if (head == null
+            || head.position == null || head.position.Length < 3
+            || head.forward == null || head.forward.Length < 3
+            || head.up == null || head.up.Length < 3)
+        {
+            return;
+        }
+        _playerHeadPosition = head.position;
+        _playerHeadForward = head.forward;
+        _playerHeadUp = head.up;
+    }
+
     public void Cleanup()
     {
         if (isIgniteBotEmbedded && !hasCleanedUp)
@@ -108,101 +215,48 @@ public class SpatialPlayerListener : MonoBehaviour
 
     void OnReceiveReady(object sender, NetMQSocketEventArgs e)
     {
-
-        if (!quitCalled)
+        if (quitCalled)
         {
-            var str = e.Socket.ReceiveFrameString();
-            if (str == "CloseApp")
+            return;
+        }
+        var str = e.Socket.ReceiveFrameString();
+        if (str == "CloseApp")
+        {
+            quitCalled = true;
+        }
+        else if (str == "MatchEvent")
+        {
+            string messageReceived = e.Socket.ReceiveFrameString();
+            try
             {
-                quitCalled = true;
-            }else if(str == "MatchEvent"){
-                string messageReceived = e.Socket.ReceiveFrameString();
-                try{
-                    MatchEvent eventMSG = JsonUtility.FromJson<MatchEvent>(messageReceived);
-                    if(eventMSG.EventTypeName == "LeaveMatch"){
-                        SetDefaultListenerPosition();
-                    }else if(eventMSG.EventTypeName == "GoalScored"){
-                        if(eventMSG.Data[0].Value == "True"){
-                            goalScored = true;
-                        }
+                MatchEvent eventMSG = JsonUtility.FromJson<MatchEvent>(messageReceived);
+                if (eventMSG.EventTypeName == "LeaveMatch")
+                {
+                    SetDefaultListenerPosition();
+                }
+                else if (eventMSG.EventTypeName == "GoalScored")
+                {
+                    if (eventMSG.Data[0].Value == "True")
+                    {
+                        goalScored = true;
                     }
-                }catch{}
+                }
             }
-            else if(str == "RawFrame")
+            catch (Exception) { }
+        }
+        else if (str == "RawFrame")
+        {
+            string messageReceived = e.Socket.ReceiveFrameString();
+            // No Thread.Sleep here: this runs on the NetMQ poller thread, and sleeping in
+            // the handler stalled every other subscription (including CloseApp) while the
+            // receive queue backed up against a high-water mark of 10.
+            try
             {
-                string messageReceived = e.Socket.ReceiveFrameString();
-                // Console.WriteLine(messageReceived + "\n");
-                Thread.Sleep(2);
-                bool found = false;
-                try
-                {
-                    Frame apiFrame = JsonUtility.FromJson<Frame>(messageReceived);
-                    foreach (Team t in apiFrame.teams)
-                    {
-                        if (t.players != null)
-                        {
-                            foreach (Player p in t.players)
-                            {
-                                if (p.name == apiFrame.client_name)
-                                {
-                                    if (t.team == "SPECTATORS")
-                                    {
-                                        isClientSpectator = true;
-                                    }
-                                    else
-                                    {
-                                        found = true;
-                                        isClientSpectator = false;
-                                        _playerHeadPosition = p.head.position;
-                                        _playerHeadForward = p.head.forward;
-                                        _playerHeadUp = p.head.up;
-                                    }
-
-                                }
-                                else if (isClientSpectator)
-                                {
-                                    if (tempPlayerName.Length < 1)
-                                    {
-                                        if (t.team != "SPECTATORS" && !found)
-                                        {
-                                            found = true;
-                                            tempPlayerName = p.name;
-                                            _playerHeadPosition = p.head.position;
-                                            _playerHeadForward = p.head.forward;
-                                            _playerHeadUp = p.head.up;
-                                        }
-                                    }
-                                    else if (p.name == tempPlayerName && t.team != "SPECTATORS")
-                                    {
-                                        found = true;
-                                        tempPlayerName = p.name;
-                                        _playerHeadPosition = p.head.position;
-                                        _playerHeadForward = p.head.forward;
-                                        _playerHeadUp = p.head.up;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    if (!found && tempPlayerName.Length > 0)
-                    {
-                        tempPlayerName = "";
-                    }
-                }
-                catch (Exception ex)
-                {
-                    try
-                    {
-                        Head defaultHeadPos = JsonUtility.FromJson<Head>(defaultPos);
-                        _playerHeadPosition = defaultHeadPos.position;
-                        _playerHeadForward = defaultHeadPos.forward;
-                        _playerHeadUp = defaultHeadPos.up;
-                    }
-                    catch
-                    {
-
-                    }
-                }
+                ApplyFrame(JsonUtility.FromJson<Frame>(messageReceived));
+            }
+            catch (Exception)
+            {
+                SetDefaultListenerPosition();
             }
         }
     }
@@ -212,133 +266,86 @@ public class SpatialPlayerListener : MonoBehaviour
         if (quitCalled)
         {
             Cleanup();
+            return;
         }
-        else
+        if (frameArrived)
         {
-            if(speakersReady){
-                if (!isIgniteBotEmbedded)
-                {
-                    StartCoroutine(GetRequest());
-                }
-    
-                StartCoroutine(LerpPosition(new Vector3(_playerHeadPosition[2], _playerHeadPosition[1], _playerHeadPosition[0]), 0.05f));
-                //playerObject.transform.position = new Vector3(_playerHeadPosition[2], _playerHeadPosition[1], _playerHeadPosition[0]);
-                headUp = new Vector3(_playerHeadUp[2], _playerHeadUp[1], _playerHeadUp[0]);
-                headForward = new Vector3(_playerHeadForward[2], _playerHeadForward[1], _playerHeadForward[0]);
-                //playerObject.transform.LookAt(headForward + transform.position, headUp);
-                StartCoroutine(LerpFunction(Quaternion.LookRotation(headForward, headUp), 0.05f));
-                //playerObject.transform.rotation = Quaternion.Lerp(playerObject.transform.rotation, Quaternion.LookRotation(headForward + transform.position, headUp), 0.03f);
-            }
+            frameArrived = false;
+            lastFrameRealtime = Time.realtimeSinceStartup;
+        }
+        if (!speakersReady)
+        {
+            return;
+        }
+
+        // Snapshot the shared arrays once. They are swapped wholesale by the NetMQ poller
+        // thread, so re-reading the fields mid-frame could mix two different frames.
+        float[] position = _playerHeadPosition;
+        float[] forward = _playerHeadForward;
+        float[] up = _playerHeadUp;
+        if (position == null || position.Length < 3
+            || forward == null || forward.Length < 3
+            || up == null || up.Length < 3)
+        {
+            return;
+        }
+
+        // This used to start a fresh 0.05s coroutine every frame, so three of them
+        // overlapped at 60fps and the oldest one snapped the transform back to a stale
+        // target as it finished. A framerate-independent smooth does the same job with no
+        // allocation and nothing fighting over the transform.
+        float t = headSmoothingTime <= 0f
+            ? 1f
+            : 1f - Mathf.Exp(-Time.deltaTime / headSmoothingTime);
+
+        Vector3 targetPosition = new Vector3(position[2], position[1], position[0]);
+        playerObject.transform.position =
+            Vector3.Lerp(playerObject.transform.position, targetPosition, t);
+
+        headUp = new Vector3(up[2], up[1], up[0]);
+        headForward = new Vector3(forward[2], forward[1], forward[0]);
+        if (headForward.sqrMagnitude > 0f)
+        {
+            Quaternion targetRotation = Quaternion.LookRotation(headForward, headUp);
+            playerObject.transform.rotation =
+                Quaternion.Slerp(playerObject.transform.rotation, targetRotation, t);
         }
     }
 
     void SetDefaultListenerPosition(){
-        Head defaultHeadPos = JsonUtility.FromJson<Head>(defaultPos);
-        _playerHeadPosition = defaultHeadPos.position;
-        _playerHeadForward = defaultHeadPos.forward;
-        _playerHeadUp = defaultHeadPos.up;
+        // Literal values rather than re-parsing a JSON document every time the API drops
+        // out; these match the defaultPos string this used to deserialise.
+        _playerHeadPosition = new float[] { 0f, 0f, -23f };
+        _playerHeadForward = new float[] { 0f, 0f, 1f };
+        _playerHeadUp = new float[] { 0f, 0f, 0f };
     }
+
     IEnumerator GetRequest()
     {
         using (UnityWebRequest webRequest = UnityWebRequest.Get(url))
         {
-            // Request and wait for the desired page. 73
             yield return webRequest.SendWebRequest();
 
             if (webRequest.isNetworkError)
             {
-                //Debug.Log(": Error: " + webRequest.error);
-                try
-                {
-                    SetDefaultListenerPosition();
-                }
-                catch (Exception e)
-                {
-                    //Debug.Log(e);
-                }
+                lastRequestFailed = true;
+                SetDefaultListenerPosition();
             }
             else
             {
-                // /Debug.Log(":\nReceived API Frame ");
-                string resp = webRequest.downloadHandler.text;
-                bool found = false;
+                lastRequestFailed = false;
                 try
                 {
-                    Frame apiFrame = JsonUtility.FromJson<Frame>(resp);
-                    playerObject = GameObject.Find("Player Listener");
-                    foreach (Team t in apiFrame.teams)
-                    {
-                        if (t.players != null)
-                        {
-                            foreach (Player p in t.players)
-                            {
-                                if (p.name == apiFrame.client_name)
-                                {
-                                    if (t.team == "SPECTATORS")
-                                    {
-                                        isClientSpectator = true;
-                                    }
-                                    else
-                                    {
-                                        found = true;
-                                        isClientSpectator = false;
-                                        _playerHeadPosition = p.head.position;
-                                        _playerHeadForward = p.head.forward;
-                                        _playerHeadUp = p.head.up;
-                                    }
-
-                                }
-                                else if (isClientSpectator)
-                                {
-                                    if (tempPlayerName.Length < 1)
-                                    {
-                                        if (t.team != "SPECTATORS" && !found)
-                                        {
-                                            found = true;
-                                            tempPlayerName = p.name;
-                                            _playerHeadPosition = p.head.position;
-                                            _playerHeadForward = p.head.forward;
-                                            _playerHeadUp = p.head.up;
-                                        }
-                                    }
-                                    else if (p.name == tempPlayerName && t.team != "SPECTATORS")
-                                    {
-                                        found = true;
-                                        tempPlayerName = p.name;
-                                        _playerHeadPosition = p.head.position;
-                                        _playerHeadForward = p.head.forward;
-                                        _playerHeadUp = p.head.up;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    var currentFrameTime = Time.realtimeSinceStartup;
-                    if ((currentFrameTime - lastAPITime) != 0)
-                    {
-                        //Debug.Log(String.Format("Frame receive rate: {0} hz", 1 / (currentFrameTime - lastAPITime)));
-                    }
-                    lastAPITime = currentFrameTime;
-                    if (!found && tempPlayerName.Length > 0)
-                    {
-                        tempPlayerName = "";
-                    }
+                    ApplyFrame(JsonUtility.FromJson<Frame>(webRequest.downloadHandler.text));
                 }
-                catch (Exception e)
+                catch (Exception)
                 {
-                    //Debug.Log(e);
-                    try
-                    {
-                        SetDefaultListenerPosition();
-                    }
-                    catch
-                    {
-
-                    }
+                    SetDefaultListenerPosition();
                 }
             }
         }
     }
+
     // Update is called once per frame
     // bool UpdatePlayerPos()
     // {        
