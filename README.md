@@ -2,7 +2,7 @@
 
 This is a system to take any audio stream (usually music) and make it sound like it is being played from "speakers" in a stadium outside of the Arena when you are playing. This is positional audio that adds realistic echo/reverberations as well as taking into account the geometry of the Arena itself so that it feels as though you are hearing your music from a stadium surrounding you.
 
-![Speaker System App](https://github.com/iblowatsports/Echo-VR-Speaker-System/blob/main/EchoSpeakerSystemV0_4_0.png?raw=true)
+![Speaker System App](https://github.com/heisthecat31/Echo-VR-Speaker-System/blob/main/EchoSpeakerSystemV0_4_0.png?raw=true)
 
   
  ## Requirements
@@ -25,7 +25,7 @@ If neither is installed, the app tells you which to get and shows a download but
  * To use Echo Speaker System, run Spark and click "Start Speaker System" from within the "Speaker System" tab
  
  ### Standalone
- * Go to **[releases](https://github.com/iblowatsports/Echo-VR-Speaker-System/releases/latest)** and download the **Installer exe. Run this as administrator to install Echo Speaker System**.
+ * Go to **[releases](https://github.com/heisthecat31/Echo-VR-Speaker-System/releases/latest)** and download the **Installer exe. Run this as administrator to install Echo Speaker System**.
  * In the in-game settings for Echo VR, make sure that "Enable API Access" is set to "Enabled"
  * Run Echo Speaker System
    * Select the application you would like played via the "speakers" (you may have to hit the refresh app list button if it does not show up). This will switch the selected app to be played via Echo Speaker System. 

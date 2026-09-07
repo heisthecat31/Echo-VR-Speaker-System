@@ -1509,36 +1509,47 @@ public class SpeakersStart : MonoBehaviour
     }
     IEnumerator GetLatestVer()
     {
-        using (UnityWebRequest webRequest = UnityWebRequest.Get("https://api.github.com/repos/iblowatsports/Echo-VR-Speaker-System/releases/latest"))
+        using (UnityWebRequest webRequest = UnityWebRequest.Get(
+            "https://api.github.com/repos/heisthecat31/Echo-VR-Speaker-System/releases/latest"))
         {
-            // Request and wait for the desired page. 73
-
             yield return webRequest.SendWebRequest();
+            // A repo with no published releases answers 404, which sets isHttpError rather
+            // than isNetworkError. Without this the error body was parsed as a release.
+            if (webRequest.isNetworkError || webRequest.isHttpError)
+            {
+                yield break;
+            }
             try
             {
-                if (webRequest.isNetworkError)
+                VersionJson latestVersion =
+                    JsonUtility.FromJson<VersionJson>(webRequest.downloadHandler.text);
+                if (latestVersion == null || string.IsNullOrEmpty(latestVersion.tag_name)
+                    || latestVersion.assets == null)
                 {
+                    yield break;
                 }
-                else
+                if (!IsNewerVersion(latestVersion.tag_name, VERSION_TAGNAME))
                 {
-                    string resp = webRequest.downloadHandler.text;
-                    VersionJson latestVersion = JsonUtility.FromJson<VersionJson>(resp);
-                    
-                    if (IsNewerVersion(latestVersion.tag_name, VERSION_TAGNAME))
-                    {
-                        latestReleaseVer = latestVersion.tag_name;
-                        latestReleaseURL = latestVersion.assets.First(url => url.browser_download_url.EndsWith("exe")).browser_download_url;
-                        UpdateDownloadBtn.onClick.AddListener(delegate
-                        {
-                            DownloadLatestRelease();
-                        });
-                        UpdateDownloadBtnGameObject.SetActive(true);
-                    }
+                    yield break;
                 }
+                Asset installer = latestVersion.assets
+                    .FirstOrDefault(a => a.browser_download_url != null
+                                         && a.browser_download_url.EndsWith("exe"));
+                if (installer == null)
+                {
+                    yield break;   // release published without an installer attached
+                }
+                latestReleaseVer = latestVersion.tag_name;
+                latestReleaseURL = installer.browser_download_url;
+                UpdateDownloadBtn.onClick.RemoveAllListeners();
+                UpdateDownloadBtn.onClick.AddListener(delegate
+                {
+                    DownloadLatestRelease();
+                });
+                UpdateDownloadBtnGameObject.SetActive(true);
             }
-            catch
+            catch (Exception)
             {
-
             }
         }
     }
@@ -1546,10 +1557,11 @@ public class SpeakersStart : MonoBehaviour
     IEnumerator GetWhatsNew()
     {
         string body = null;
-        using (UnityWebRequest webRequest = UnityWebRequest.Get("https://api.github.com/repos/iblowatsports/Echo-VR-Speaker-System/releases"))
+        using (UnityWebRequest webRequest = UnityWebRequest.Get(
+            "https://api.github.com/repos/heisthecat31/Echo-VR-Speaker-System/releases"))
         {
             yield return webRequest.SendWebRequest();
-            if (!webRequest.isNetworkError)
+            if (!webRequest.isNetworkError && !webRequest.isHttpError)
             {
                 try
                 {
