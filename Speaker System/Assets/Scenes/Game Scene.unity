@@ -20744,7 +20744,7 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: 034fbd32a887ca647a425aac7b9a5e6f, type: 3}
   m_Name: 
   m_EditorClassIdentifier: 
-  VERSION_TAGNAME: v0.4.4
+  VERSION_TAGNAME: v0.4.5
   playerXAbsMult: 1
   tunnelEndMapDist: 40.0001
   maxTunnelMapDist: 90

@@ -24,7 +24,9 @@ using System.ComponentModel;
 
 public class SpeakersStart : MonoBehaviour
 {
-    public string VERSION_TAGNAME = "v0.4.5";
+    // const, not a public field: as a serialised field the scene's stored value
+    // overrode this and the app kept reporting the previous version.
+    public const string VERSION_TAGNAME = "v0.4.5";
 
     /// <summary>
     /// Shown when GitHub has no release for this tag yet, or is unreachable. The

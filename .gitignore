@@ -32,6 +32,9 @@ slnx.sqlite
 *.csproj
 *.unityproj
 *.sln
+# ...but hand-written helper projects under Tools/ are real source.
+!Tools/**/*.csproj
+!Tools/**/*.sln
 
 # Build results -------------------------------------------------------------
 [Oo]bj/
